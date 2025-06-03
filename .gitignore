@@ -12,3 +12,8 @@ plots
 
 # VScode
 .vscode
+
+# Notebook checkpoints
+.ipynb_checkpoints
+.cache*
+.cache
