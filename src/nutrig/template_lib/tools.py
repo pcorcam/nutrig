@@ -1,173 +1,54 @@
 #! /usr/bin/env python3
 '''
-Tools for scripts in $NUTRIG/template_lib/v1/
+Tools for scripts in $NUTRIG/template_lib/v2/
 '''
 
 # system
-import glob
+import sys
 import warnings
+import logging
 
 # scipy
 import numpy as np
 from scipy.signal import find_peaks
 
-# grandlib
-import grand.dataio.root_trees as rt # type: ignore
+logger = logging.getLogger(__name__)
 
 
-'''
-© Pablo Correa, 5 January 2024
+###-###-###-###-###-###-###- LOGGER -###-###-###-###-###-###-###
 
-Description:
-    This script contains the tools to:
-    - analyze the pulse shapes of air-shower simulations (for GP300)
-    - TODO: create a library of templates for a trigger algorithm
-'''
+def get_logging_level(level_str):
 
-
-def get_sim_root_files(sim_dir,
-                       rf_chain,
-                       substr=None):
-    '''
-    Description
-    -----------
-    Function that obtains the GRANDroot simulation files in `sim_dir`.
-    Two lists are returned:
-    - list of electric-field ZHaiRES/CoREAS simulation files, including shower properties;
-    - list of corresponding voltage simulation files, see `convert_efield_to_voltage.py`.
+    if level_str == 'debug':
+        level = logging.DEBUG
+    elif level_str == 'info':
+        level = logging.INFO
+    elif level_str == 'warning':
+        level = logging.WARNING
+    elif level_str == 'error':
+        level = logging.ERROR
+    elif level_str == 'critical':
+        level = logging.CRITICAL
+    else:
+        raise Exception('No valid logging level!')
     
-
-    Arguments
-    ---------
-    `sim_dir`
-    type        : str
-    description : Directory where the simulations are stored in GRANDroot format.
-                  Should contain `efield` and `voltage` subdirectories.
-
-    `rf_chain`'
-    type        : str
-    description : Version of the RF chain used for the voltage simulations.
-                  Example: rfv1, rfv1, ...
-
-    `substr` (optional)
-    type        : str
-    description : Required substring in filenames.
-                  Can be used to e.g. only select simulations for 'Proton'.
-
-                                
-    Returns
-    -------
-    `efield_files`
-    type        : list[str]
-    description : List containing all electric-field simulation files.
-
-    `voltage_files`
-    type        : list[str]
-    description : List containing all corresponding voltage simulation files.
-    '''
-
-    efield_dir  = sim_dir + 'efield/'
-    voltage_dir = sim_dir + f'voltage_{rf_chain}/'  
-
-    efield_files  = np.array( sorted( glob.glob(efield_dir+'*.root') ) )
-    voltage_files = np.array( sorted( glob.glob(voltage_dir+'*.root') ) )
-
-    # Sometimes a bug occured in converting efield to voltage
-    # Remove those efield files from the list
-    # Add index j to speed up the process, arrays are sorted
-    mask = np.ones(len(efield_files),dtype=bool)
-    j = 0
-
-    for i, efield_file in enumerate(efield_files):
-        voltage_file = efield_file.replace('efield',f'voltage_{rf_chain}').replace('gr_','gr_voltage_')
-        if voltage_file in voltage_files[i-j:]:
-            continue
-        else:
-            mask[i] = False
-            j += 1 
-    #e_not = efield_files[np.logical_not(mask)]
-    efield_files = efield_files[mask]
-
-    # Only keep files with given substring
-    if substr is not None:
-        mask = [substr in efield_file for efield_file in efield_files]
-        efield_files  = efield_files[mask]
-        voltage_files = voltage_files[mask]
-
-    # Need to convert back to list so that we can open the files with grandlib
-    efield_files  = efield_files.tolist()
-    voltage_files = voltage_files.tolist()
-
-    return efield_files, voltage_files#, e_not
+    return level
 
 
-def digitize(trace,
-             simu_sampling_rate=2e3,
-             adc_sampling_rate=500,
-             adc_to_voltage=0.9e6/2**13,
-             quantize=True):
-    '''
-    Description
-    -----------
-    Performs the virtual digitization of voltage traces at the ADC level:
-    - desamples the simulated signal to the ADC sampling rate;
-    - converts voltage to ADC counts.
-    NOTE: this step should already be included in a future grandlib version!
+def load_logger(level='info'):
+    logger  = logging.getLogger(__name__)
+    level   = get_logging_level(level)
+    logger.setLevel(level)
 
-    Arguments
-    ---------
-    `trace`
-    type        : np.ndarray[float]
-    units       : µV
-    description : Array of voltage traces at the ADC level with dimensions (3,N_simu_samples).
+    handler   = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-7.7s]  %(message)s")
 
-    `simu_sampling_rate`
-    type        : float
-    units       : MHz
-    description : Sampling rate used in the ZHaiRES/CoREAS simulation. Typically 2 GHz.
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
 
-    `adc_sampling_rate`
-    type        : float
-    units       : MHz
-    description : Sampling rate of the ADC. Currently 500 MHz.
+    logger.addHandler(handler)
 
-    `adc_to_voltage`
-    type        : float
-    units       : µV
-    description : Conversion factor from ADC counts to voltage.
-
-    `quantize`
-    type        : bool
-    description : Option to quantize the ADC signal as integers.
-                  Default should be True. False is useful for tests / template construction.
-    
-                                
-    Returns
-    -------
-    `trace`
-    type        : np.ndarray[float]
-    units       : LSB
-    description : The digitized array of voltage traces, with the ADC sampling rate and in ADC counts.
-    '''
-    
-    # Convert voltage to ADC
-    trace = trace/adc_to_voltage
-    
-    # Truncate to get the closest integer
-    if quantize:
-        trace = np.trunc(trace)
-
-    # Obtain desampling factor
-    desampling_factor = int(simu_sampling_rate/adc_sampling_rate)
-
-    if desampling_factor < 1:
-        raise Exception('Simulation sampling rate can not be lower than ADC sampling rate!',desampling_factor)
-    if not ( (desampling_factor & (desampling_factor-1) == 0) and desampling_factor != 0 ):
-        warn = 'Desampling factor is not a power of 2: {}'.format(desampling_factor)
-        warnings.warn(warn)
-
-    # Return trace in ADC counts and with the ADC sampling rate
-    return trace[:,::desampling_factor]
+    return logger
 
 
 def above_thresh(trace,
@@ -339,6 +220,7 @@ def get_omega_c(refraction_idx):
 
 # Compute the opening angle between the shower direction and DU-Xmax direction
 def get_omega_from_Xmax_pos(du_xyz,
+                            shower_core_pos,
                             Xmax_pos_shc):
     
     # Coordinate system: shower core at the origin, X = northing, Y = easting, Z = height
@@ -350,12 +232,15 @@ def get_omega_from_Xmax_pos(du_xyz,
         mean_du_height = np.mean(du_xyz[:,2])
         du_xyz[:,2] -= mean_du_height
 
+    # Transform du_xyz to shower-core frame
+    du_xyz_shc = du_xyz - shower_core_pos
+
     # Direction vector of shower
     k = - Xmax_pos_shc / np.linalg.norm(Xmax_pos_shc)
 
     # Direction vectors of DUs pointing to Xmax
-    dist_du_Xmax = np.linalg.norm(du_xyz-Xmax_pos_shc,axis=1)
-    dX = ( (du_xyz - Xmax_pos_shc).T / dist_du_Xmax ).T
+    dist_du_Xmax = np.linalg.norm(du_xyz_shc-Xmax_pos_shc,axis=1)
+    dX = ( (du_xyz_shc - Xmax_pos_shc).T / dist_du_Xmax ).T
 
     # Get the cone opening angle (between shower axis and DU-Xmax)
     cos_omega = np.dot(dX,k)
@@ -364,33 +249,3 @@ def get_omega_from_Xmax_pos(du_xyz,
     cos_omega[cos_omega>1.] = 1.
     
     return np.arccos(cos_omega)
-
-
-def set_trace_length(trace,
-                     target_length):
-    
-    in_trace_length = trace.shape[-1]
-    
-    # Pad with zeros at end if trace length is smaller target length
-    if in_trace_length <= target_length:
-        out_trace = np.zeros( (trace.shape[0],target_length) )
-        out_trace[:,:in_trace_length] = trace
-
-    # Pulse simulations are normally at the beginning of trace
-    else:
-        out_trace = trace[:,:target_length]
-    
-    return out_trace
-
-
-def load_traces(trace_dir,
-                trace_length=1024):
-
-    trace_files = sorted( glob.glob(trace_dir+'/*.npz') )
-    traces      = np.zeros( (1,3,trace_length) )
-
-    for trace_file in trace_files[10:11]:
-        f      = np.load(trace_file)
-        traces = np.concatenate( (traces,f['traces_adc']) )
-
-    return traces[1:]

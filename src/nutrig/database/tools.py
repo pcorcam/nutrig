@@ -6,11 +6,10 @@ import sys
 import logging
 
 import numpy as np
-from scipy import signal
+from scipy.signal import lfilter, minimum_phase
+from scipy.signal.windows import gaussian
 
 import grand.dataio.root_trees as rt
-
-from template_lib.tools import get_refraction_index_at_pos, get_omega_c, get_omega_from_Xmax_pos
 
 logger = logging.getLogger(__name__)
 
@@ -53,678 +52,599 @@ def load_logger(level='info'):
 
 ###-###-###-###-###-###-###- FUNCTIONS -###-###-###-###-###-###-###
 
-def digitize(voltage_traces,
-             simu_sampling_rate=2e3,
-             adc_sampling_rate=500,
-             adc_to_voltage=0.9e6/2**13,
-             float_adc=False):
+
+def get_baseline_calib(baseline_dir='/sps/grand/pcorrea/gp80/baseline_calibration/RUN148'):
     '''
-    Description
-    -----------
-    Performs the virtual digitization of voltage traces at the ADC level:
-    - desamples the simulated signal to the ADC sampling rate;
-    - converts voltage to ADC counts.
-    NOTE: this step should already be included in a future grandlib version!
+    Obtain the baseline calibration for each channel of each DU from Nathan's analysis of RUN 145.
+    '''
+    # One file of mean baselines per channel
+    files = sorted( glob.glob( os.path.join(baseline_dir,'*.txt') ) )
+    
+    du_ids         = np.loadtxt(files[0],skiprows=0,usecols=0,delimiter=':').astype(int)
+    baseline_calib = {du : np.zeros(3,dtype=int) for du in du_ids}
+
+    for ch, file in enumerate(files):
+        # Round to nearest integer since ADC counts are integer
+        baselines_ch = np.round( np.loadtxt(file,skiprows=0,usecols=1) )
+        for j, du in enumerate(du_ids):
+            baseline_calib[du][ch] = baselines_ch[j]
+
+    return baseline_calib
+
+
+def get_gauss_window_edges(fade,
+                           n_samples,
+                           steepness=4):
+    '''
+    Obtain a symmetric window with a Gaussian fade-in and fade-out.
 
     Arguments
     ---------
-    `voltage_traces`
-    type        : np.ndarray[float]
-    units       : µV
-    description : Array of voltage traces at the ADC level with dimensions (N_du,3,N_simu_samples).
+    `fade`
+    type        : int
+    description : Number of samples over which to apply the fade.
 
-    `simu_sampling_rate`
+    `n_samples`
+    type        : int
+    description : Total number of samples in a trace.
+
+    `steepness`
     type        : float
-    units       : MHz
-    description : Sampling rate used in the ZHaiRES/CoREAS simulation. Typically 2 GHz.
-
-    `adc_sampling_rate`
-    type        : float
-    units       : MHz
-    description : Sampling rate of the ADC. Currently 500 MHz.
-
-    `adc_to_voltage`
-    type        : float
-    units       : µV
-    description : Conversion factor from ADC counts to voltage.
-
-    `float_adc`
-    type        : bool
-    description : Option to save ADC counts as a float number, without quantifying to an integer value.
+    description : Steepness of the Gaussian edges.
     
                                 
     Returns
     -------
-    `adc_traces`
+    `window`
     type        : np.ndarray[float]
-    units       : LSB
-    description : The digitized array of voltage traces, with the ADC sampling rate and in ADC counts.
+    description : The window, normalized between [0,1], with shape (N_samples).
     '''
-    
-    # Convert voltage to ADC
-    adc_traces = voltage_traces/adc_to_voltage
 
-    # Truncate to get the closest integer
-    if not float_adc:
-        adc_traces = np.trunc(adc_traces)
+    std = fade/steepness
+    gauss = gaussian(fade*2,std)
+    gauss /= np.max(gauss) # normalize to 1
 
-    # Obtain desampling factor
-    desampling_factor = int(simu_sampling_rate/adc_sampling_rate)
+    fade_in  = gauss[:fade]
+    fade_out = gauss[-fade:]
 
-    if desampling_factor < 1:
-        raise Exception('Simulation sampling rate can not be lower than ADC sampling rate!',desampling_factor)
-    if not ( (desampling_factor & (desampling_factor-1) == 0) and desampling_factor != 0 ):
-        warn = 'Desampling factor is not a power of 2: {}'.format(desampling_factor)
-        logger.warning(warn)
+    window = np.ones(n_samples)
+    window[:fade] = fade_in
+    window[-fade:] = fade_out
 
-    # Return trace in ADC counts and with the ADC sampling rate
-    return adc_traces[...,::desampling_factor]
+    return window
 
 
-def set_trace_length(traces,
-                     target_length):
-    
-    logger.info(f'Setting trace length to {target_length}')
+def apply_notch_filter(trace,
+                       f_notch,
+                       r,
+                       f_sample=5e8):
 
-    in_trace_length = traces.shape[-1]
-    
-    # Pad with zeros at end if trace length is smaller target length
-    if in_trace_length <= target_length:
-        out_traces = np.zeros( (traces.shape[0],traces.shape[1],target_length) )
-        out_traces[...,:in_trace_length] = traces
-
-    # Pulse simulations are normally at the beginning of trace
-    else:
-        out_traces = traces[...,:target_length]
-    
-    return out_traces
-
-
-def extract_shower_params(voltage_file,
-                          do_digitization=True):
-
-    try:
-        tvoltage = rt.TVoltage(voltage_file)
-    except:
-        logger.error(f'No valid voltage file: {voltage_file}')
-        raise Exception(f'No valid voltage file: {voltage_file}')
-        
-    sim_dir     = os.path.dirname( os.path.dirname( os.path.abspath(voltage_file) ) )
-    efield_dir  = os.path.join( sim_dir,'efield' )
-    efield_file = os.path.join( efield_dir,os.path.basename(voltage_file).replace('voltage_','') )
-
-    try:
-        trun    = rt.TRun(efield_file)
-        tshower = rt.TShower(efield_file)
-    except:
-        logger.error(f'No valid efield file: {efield_file}')
-        raise Exception(f'No valid efield file: {efield_file}')
-    
-    logger.info(f'Getting voltage traces from {voltage_file}')
-
-    tvoltage.get_entry(0), trun.get_entry(0), tshower.get_entry(0)
-
-
-    shower_params = {}
-
-    traces = np.array(tvoltage.trace)
-
-    if do_digitization:
-        logger.info(f'Digitizing voltage traces to obtain ADC traces')
-        traces = digitize(traces)
-        traces = traces.astype(int)
-
-    shower_params['traces']          = traces
-    shower_params['shower_core_pos'] = np.array(tshower.shower_core_pos)
-    shower_params['xmax_pos_shc']    = np.array(tshower.xmax_pos_shc)
-    shower_params['du_xyz']          = np.array(trun.du_xyz) # GP300 coords in shower-core frame
-    shower_params['du_seconds']      = np.array(tvoltage.du_seconds)
-    shower_params['du_nanoseconds']  = np.array(tvoltage.du_nanoseconds)
-    shower_params['omega']           = np.rad2deg( get_omega_from_Xmax_pos(shower_params['du_xyz'],shower_params['xmax_pos_shc']) ) # [deg]
-    shower_params['omega_c']         = np.rad2deg( get_omega_c( get_refraction_index_at_pos(shower_params['xmax_pos_shc']) ) ) # [deg]
-    shower_params['energy']          = tshower.energy_primary # [EeV]
-    shower_params['zenith']          = tshower.zenith # [deg]
-    shower_params['azimuth']         = tshower.azimuth # [deg]
-    shower_params['primary_type']    = tshower.primary_type
-
-    # Put in DU positions in true GP300 coordinates
-    shower_params['du_xyz'] += shower_params['shower_core_pos']
-
-    tvoltage.stop_using()
-    trun.stop_using()
-    tshower.stop_using()
-
-    tvoltage.close_file()
-    trun.close_file()
-    tshower.close_file()
-
-    return shower_params
-
-
-def get_du_ids(du_xyz_input,
-               gp300_layout_file='/pbs/home/p/pcorrea/grand/layout/F06970G5G2X_GP300_layout_grandcs_DUonGround.dat'):
     '''
-    Finds the DU IDs for a set of DU coordinates in the GP300 array.
-
+    Notch filter implementation, mimicking the notch filter on the FEB.
+    Adapted from Kato Sei's script.
+    
     Arguments
     ---------
-    `du_xyz_input`
-    type        : np.ndarray[float]
-    units       : m
-    description : Array of XYZ positions of a set of DUs, with shape (N_du,3). (X,Y)=(0,0) should be at the center of GP300.
-
-    `gp300_layout_file`
-    type        : str
-    description : Path to .dat file containing the layout information of GP300.
-    
-                                
-    Returns
-    -------
-    `du_ids`
+    `trace`
     type        : np.ndarray[int]
-    description : The DU IDs corresponding to the input coordinates.
-    '''
+    units       : ADC counts
+    description : Single ADC trace for one channel, with shape (N_samples).
 
-    try:
-        gp300_layout_info = np.loadtxt(gp300_layout_file,skiprows=2,usecols=(0,2,3))
-    except:
-        #logger.error('No valid GP300 layout file provided.')
-        raise Exception('No valid GP300 layout file provided.')
+    `f_notch`
+    type        : float
+    units       : Hz
+    description : Frequency of the notch filter.
 
-    # We only care about the X,Y coordinates here
-    gp300_du_ids      = gp300_layout_info[:,0]
-    gp300_du_xy       = gp300_layout_info[:,1:]
-    du_xy_input       = du_xyz_input[:,:2]
+    `r`
+    type        : float
+    units       : Hz
+    description : Radius of the notch filter.
 
-    du_ids = np.zeros(du_xyz_input.shape[0],dtype=int)
-
-    for i, du_pos in enumerate( du_xy_input ):
-        for gp300_du_id, gp300_pos in zip(gp300_du_ids,gp300_du_xy):
-            if np.linalg.norm( du_pos - gp300_pos ) < 0.1: # to account for numerical errors
-                du_ids[i] = gp300_du_id
-                break
+    `f_sample`
+    type        : float
+    units       : Hz
+    description : Sampling rate of the ADC. Currently 500 MHz.
     
-    return du_ids
-
-
-def extract_trigger_parameters(trace, trigger_config, baseline=0):
-    # Extract the trigger infos from a trace
-
-    # Parameters :
-    # ------------
-    # trace, numpy.ndarray: 
-    # traces in ADC unit
-    # trigger_config, dict:
-    # the trigger parameters set in DAQ
-
-    # Returns :
-    # ---------
-    # Index in the trace when the first T1 crossing happens
-    # Indices in the trace of T2 crossing happens
-    # Number of T2 crossings
-    # Q, Peak/NC
-
-    # Find the position of the first T1 crossing
-    index_t1_crossing = np.where(np.abs(trace) > trigger_config["th1"],
-                                 np.arange(len(trace)), -1)
-    dict_trigger_infos = dict()
+                                
+    Returns
+    -------
+    `y`
+    type        : np.ndarray[float]
+    units       : "ADC counts"
+    description : The filtered trace, with shape (N_samples).
+    '''
     
-    mask_T1_crossing = (index_t1_crossing != -1)
-    if sum(mask_T1_crossing) == 0:
-        # No T1 crossing 
-        raise ValueError("No T1 crossing!")
+    nu = 2. * np.pi * f_notch / f_sample
+
+    ### Calculation of coefficients
+    a1 = 2. * (r ** 4) * np.cos(4.*nu)
+    a2 = - (r ** 8)
+    b1 = - 2. * np.cos(nu)
+    b2 = 1
+    b3 = 2. * r * np.cos(nu)
+    b4 = r * r
+    b5 = 2. * r * r * np.cos(2.*nu)
+    b6 = r ** 4
+
+    ### Calculation of the trace after passing the digital notch filter
+    ### Parameters:
+    ### y[n_sample]: output trace
+    ### y1[n_sample] & y2[n_sample]: intermediate variables
+
+    # Try reflection padding
+    padding_idx = 0 # up to which index you want to do the padding, 0 does nothing
+
+    trace_padded = np.concatenate((trace[:padding_idx][::-1],trace))
+    y, y1, y2 = np.zeros(trace_padded.shape[0]), np.zeros(trace_padded.shape[0]), np.zeros(trace_padded.shape[0])
+
+    #beginning at sample 10 to avoid the artificial peak
+    #start, end = 0, trace.shape[1] #1024 for MD data and 2048 for DC2
+    for n in range(trace_padded.shape[0]):
+    #for n in range(start, end):
+        y1[n] = b2 * trace_padded[n] + b1 * trace_padded[n-1] + trace_padded[n-2]
+        y2[n] = y1[n] + b3 * y1[n-1] + b4 * y1[n-2]
+        y[n]  = a1 * y[n-4] + a2 * y[n-8] + y2[n-2] + b5 * y2[n-4] + b6 * y2[n-6]
+
+    return y[padding_idx:]
+
+
+def filter_traces_notch(traces):
+    '''
+    Wrapper for the `apply_notch_filter` function.
+    Performs all notch filters for an array of multiple traces.
+
+    Arguments
+    ---------
+    - `traces`
+      + type        : `np.ndarray[int]`
+      + units       : ADC counts
+      + description : Array of ADC traces, with shape `(N_traces,N_channels,N_samples)`.
+                                
+    Returns
+    -------
+    - `traces_filtered`
+      + type        : `np.ndarray[float]`
+      + units       : "ADC counts"
+      + description : Array of filtered ADC traces, with shape `(N_traces,N_channels,N_samples)`.
+    '''
+
+    freqs_notch = np.array( [39, 119.4, 132, 137.8, 121.5, 134.2, 124.7, 119.2] )*1e6 # [Hz]
+    radii_notch = np.array( [0.9, 0.98, 0.95, 0.98, 0.96, 0.96, 0.96, 0.98] )
     
-    dict_trigger_infos['index_T1_crossing'] = None
-    # Tquiet to decide the quiet time before the T1 crossing 
-    for i in index_t1_crossing[mask_T1_crossing]:
-       # Abs value not exceeds the T1 threshold
-       if i - trigger_config["t_quiet"]//2 < 0:
-          raise ValueError("Not enough data before T1 crossing!")
-       if np.all(np.abs(trace[np.max(0, i - trigger_config['t_quiet'] // 2):i]) < trigger_config["th1"]):
-          dict_trigger_infos["index_T1_crossing"] = i
-          # the first T1 crossing satisfying the quiet condition
-          break
-    if dict_trigger_infos['index_T1_crossing'] == None:
-       raise ValueError("No T1 crossing with Tquiet satified!")
-    # The trigger logic works for the timewindow given by T_period after T1 crossing.
-    # Count number of T2 crossings, relevant pars: T2, NCmin, NCmax, T_sepmax
-    # From ns to index, divided by two for 500MHz sampling rate
-    period_after_T1_crossing = trace[dict_trigger_infos["index_T1_crossing"]:dict_trigger_infos["index_T1_crossing"]+trigger_config['t_period']//2]
-    # All the points above +T2
-    positive_T2_crossing = (np.array(period_after_T1_crossing) > trigger_config['th2']).astype(int)
-    # Positive crossing, the point before which is below T2.
-    mask_T2_crossing_positive = np.diff(positive_T2_crossing) == 1
-    # if np.sum(mask_T2_crossing_positive) > 0:
-    #     index_T2_crossing_positive = np.arange(len(period_after_T1_crossing) - 1)[mask_T2_crossing_positive]
-    negative_T2_crossing = (np.array(period_after_T1_crossing) < - trigger_config['th2']).astype(int)
-    mask_T2_crossing_negative = np.diff(negative_T2_crossing) == 1
-    # if np.sum(mask_T2_crossing_negative) > 0:
-    #     index_T2_crossing_negative = np.arange(len(period_after_T1_crossing) - 1)[mask_T2_crossing_negative]
-    # n_T2_crossing_negative = np.len(index_T2_crossing_positive)
-    # Register the first T1 crossing as a T2 crossing
-    mask_first_T1_crossing = np.zeros(len(period_after_T1_crossing), dtype=bool)
-    mask_first_T1_crossing[0] = True
-    mask_first_T1_crossing[1:] = (mask_T2_crossing_positive | mask_T2_crossing_negative)
-    index_T2_crossing = np.arange(len(period_after_T1_crossing))[mask_first_T1_crossing]
-    n_T2_crossing = 1 # Starting from the first T1 crossing.
-    dict_trigger_infos["index_T2_crossing"] = [0]
-    if len(index_T2_crossing) > 1:
-      for i, j in zip(index_T2_crossing[:-1], index_T2_crossing[1:]):
-          # The separation between successive T2 crossings
-          time_separation = (j - i) * 2
-          if time_separation <= trigger_config["t_sepmax"]:
-              n_T2_crossing += 1
-              dict_trigger_infos["index_T2_crossing"].append(j)
-          else:
-              # Violate the maximum separation, stop counting NC
-              # Save the position of the last T2 crossing, i.e., i
-              # to be used for calculating the Q value
-            break
-    else:
-      n_T2_crossing = 1
-      j = 1
-    # Change the reference of indices of T2 crossing
-    dict_trigger_infos["index_T2_crossing"] = np.array(dict_trigger_infos["index_T2_crossing"]) + dict_trigger_infos["index_T1_crossing"]
-    dict_trigger_infos["NC"] = n_T2_crossing
-    # Calulate the peak value
-    dict_trigger_infos["Q"] = (np.max(np.abs(period_after_T1_crossing[:j])) - baseline) / dict_trigger_infos["NC"]
-    return dict_trigger_infos
-
-
-def search_windows(trace,
-                   filter_status='off',
-                   threshold1=55,
-                   threshold2=35,
-                   maxRMS=21,
-                   num_cross=2+4,
-                   num_separation=750,
-                   num_interval=26,
-                   sample_frequency=500,
-                   cutoff_frequency=50,
-                   samples_from_trace_edge=100):
-    '''
-    Adapted from Xishui Tian's transient search.
-    Searches for pulse windows in a trace with a double-threshold trigger.
-    Default values are determined from analysis with
-    `test_pretrigger.py` and `find_pretrigger_threshold.ipynb`
-    '''
-
-    # samples_from_trace_edge = max(num_interval,samples_from_trace_edge)
-    trace = trace[samples_from_trace_edge:trace.shape[-1]-samples_from_trace_edge]
-
-    window_list     = []
-    trigger_id_list = []
-
-    # if filter_status == 'on':
-    #     trace = signal.high_pass_filter(trace=trace, sample_frequency=sample_frequency, cutoff_frequency=cutoff_frequency)
- 
-    # stop if there are no transients/pulses
-    cross_threshold1 = np.abs(trace) > threshold1
-    cross_threshold2 = np.abs(trace) > threshold2
-    # print(f'\n\n\n thresholds {threshold1, threshold2, np.sum(cross_threshold1), np.sum(cross_threshold2), num_cross}')
-    if np.sum(cross_threshold1[num_interval:]) < 2 or np.sum(cross_threshold2[num_interval:]) < num_cross:
-        #logger.debug(f'Not enough crossings: T1 = {np.sum(cross_threshold1[num_interval:])}; T2 {np.sum(cross_threshold2[num_interval:])}')
-        return window_list, trigger_id_list
-
-    # exclude abnormal traces
-    # if get1trace_RMS(trace=trace) > maxRMS or max(get1trace_PSD(trace=trace)) > maxPSD:
-    #     return []
+    traces_filtered = np.zeros( traces.shape,dtype=int )
     
-    # find trace positions where threshold1 is exceeded
-    cross1_ids = np.flatnonzero(cross_threshold1)
-    cross1_ids = cross1_ids[cross1_ids>=num_interval] # first T1 crossing can only be after quiet time condition
-    #logger.debug(cross1_ids)
-    # find the separations between consecutive threshold crossings
-    cross1_separations = np.diff(cross1_ids)
-
-    # locate pulse indices in threshold crossing indices
-    pulse_ids = np.flatnonzero(cross1_separations > num_separation)
-    pulse_ids = np.concatenate(([-1], pulse_ids, [len(cross1_ids)-1]))
-    
-    # search all transients/pulses
-    for i in range(len(pulse_ids)-1):
-        trigger_id = cross1_ids[pulse_ids[i]+1]
-
-        # quiet time condition before trigger
-        if np.sum(cross_threshold1[trigger_id-num_interval:trigger_id]) > 0:
-            #logger.debug(f'Pulse {i}: Quiet time condition not fulfilled: {np.sum(cross_threshold1[trigger_id-num_interval:trigger_id])}')
-            continue
-
-        # get the start index of current pulse
-        start_id = trigger_id - num_interval
-        start_id = max(0, start_id) # fix the 1st pulse
-
-        # get the stop index of current pulse
-        cross2_ids       = np.flatnonzero(cross_threshold2)[np.flatnonzero(cross_threshold2) >= trigger_id]
-        cross2_intervals = np.diff(cross2_ids)
-        pulse2_ids       = np.flatnonzero(cross2_intervals > num_interval)
-        if len(pulse2_ids) == 0:
-            stop_id = cross2_ids[-1] + num_interval
-        else:
-            stop_id = cross2_ids[pulse2_ids[0]] + num_interval
-        stop_id = min(len(trace)-1, stop_id) # fix the last pulse
-        
-        if np.sum(cross_threshold1[start_id:stop_id+1]) >= 2 and np.sum(cross_threshold2[start_id:stop_id+1]) >= num_cross:
-            #if np.sum(cross_threshold2[start_id:stop_id+1]) < 32: # This will not work for very high SNR signals compared to the thresholds
-                #logger.debug('Too many T2 crossings')
-            window_list.append([start_id+samples_from_trace_edge, stop_id+samples_from_trace_edge])
-            trigger_id_list.append(trigger_id+samples_from_trace_edge)
-            # else:
-            #     print(np.sum(cross_threshold2[start_id:stop_id+1]))
-
-    return window_list, trigger_id_list
-
-
-def search_pulse(trace,
-                 filter_status='on',
-                 threshold1=60,
-                 threshold2=36,
-                 num_cross=2+4,
-                 num_interval=16,
-                 sample_frequency=500,
-                 cutoff_frequency=50,
-                 samples_from_trace_edge=0):
-    '''
-    Adapted from Xishui Tian's transient search.
-    Searches for the FIRST pulse window in a trace with a double-threshold trigger.
-    This mimics the trigger in hardware.
-    MOD: added a parameter to avoid triggeres near the trace edge.
-    '''
-
-    trace = trace[samples_from_trace_edge:trace.shape[-1]-samples_from_trace_edge]
-
-    # if filter_status == 'on':
-    #     trace = high_pass_filter(trace=trace, sample_frequency=sample_frequency, cutoff_frequency=cutoff_frequency)
-
-    # stop if there are no transients/pulses                                                                                                                                                                                                         
-    cross_threshold1 = np.abs(trace) > threshold1
-    cross_threshold2 = np.abs(trace) > threshold2
-    if np.sum(cross_threshold1) < 2 or np.sum(cross_threshold2) < num_cross:
-        logger.debug('Not enough T1 or T2 crossings')
-        return [], []
-
-    # exclude abnormal traces                                                                                                                                                                                                                        
-    # if get1trace_RMS(trace=trace) > maxRMS or max(get1trace_PSD(trace=trace)) > maxPSD:
-    #     return []
-
-    # find trace positions where threshold1 is exceeded                                                                                                                                                                                              
-    cross1_ids = np.flatnonzero(cross_threshold1)
-
-    # find the separations between consecutive threshold crossings                                                                                                                                                                                   
-    cross1_separations = np.diff(cross1_ids)
-
-    # locate pulse indices in threshold crossing indices                                                                                                                                                                                             
-    pulse_ids = np.flatnonzero(cross1_separations > num_interval)
-    pulse_ids = np.concatenate(([-1], pulse_ids, [len(cross1_ids)-1]))
-
-    # search all transients/pulses                                                                                                                                                                                                                   
-    for i in range(len(pulse_ids)-1):
-        trigger_id = cross1_ids[pulse_ids[i]+1]
-        # if np.sum(cross_threshold2[trigger_id-num_interval:trigger_id]) > 2:
-        #     continue
-        
-        if np.sum(cross_threshold1[trigger_id-num_interval:trigger_id]) > 0:
-            logger.debug('Quiet time condition not fulfilled')
-            #print('test',np.sum(cross_threshold1[trigger_id-num_interval:trigger_id]))
-            continue
-
-        # get the start index of current pulse                                                                                                                                                                                                       
-        start_id = trigger_id - num_interval
-        start_id = max(0, start_id) # fix the 1st pulse                                                                                                                                                                                              
-
-        # get the stop index of current pulse                                                                                                                                                                                                        
-        cross2_ids       = np.flatnonzero(cross_threshold2)[np.flatnonzero(cross_threshold2) >= trigger_id]
-        cross2_intervals = np.diff(cross2_ids)
-        pulse2_ids       = np.flatnonzero(cross2_intervals > num_interval)
-        if len(pulse2_ids) == 0:
-            stop_id = cross2_ids[-1] + num_interval
-        else:
-            stop_id = cross2_ids[pulse2_ids[0]] + num_interval
-        stop_id = min(len(trace)-1, stop_id) # fix the last pulse                                                                                                                                                                                    
-        #print([start_id+samples_from_trace_edge,stop_id+samples_from_trace_edge])
-        #print(np.sum(cross_threshold1[start_id:stop_id+1]),np.sum(cross_threshold2[start_id:stop_id+1]))
-        
-        if np.sum(cross_threshold1[start_id:stop_id+1]) >= 2 and np.sum(cross_threshold2[start_id:stop_id+1]) >= num_cross:
-            #if np.sum(cross_threshold2[start_id:stop_id+1]) < 32: # This will not work for very high SNR signals compared to the thresholds
-            #if np.sum(cross_threshold2[start_id:stop_id+1]) - np.sum(cross_threshold1[start_id:stop_id+1]) < 32-2:
-            return [[start_id+samples_from_trace_edge, stop_id+samples_from_trace_edge]], [trigger_id+samples_from_trace_edge]
-
-    return [], []
-
-
-def thresh_trigger(trace,
-                   include_Z=False,
-                   **kwargs):
-    '''
-    Adapted from Xishui Tian's transient search.
-    Performs the double-threshold trigger for a given trace.
-    '''
-
-    channels = ['X','Y','Z']
-    if not include_Z:
-        channels = channels[:2]
-    
-    # Search for pulses                                                                                                                                                                                                                                                         
-    num_pulse = 0
-    list_trigger_flag = [0, 0, 0]
-    trigger_pos_ch = -1*np.ones(3,dtype=int) # the 'trigger position' is the sample where the first pulse is recorded
-
-    for i, channel in enumerate(channels):                                                                                                                                                                                                  
-        windows, trigger_ids = search_windows(trace[i], **kwargs) #trace=high_pass_filter(trace[i])
-        num_pulse += len(windows)
-        if len(windows):
-            list_trigger_flag[i] = 1
-            trigger_pos_ch[i] = trigger_ids[0]
-
-    # The final trigger position is where is where the first trigger occurs in all channels
-    if num_pulse:
-        trigger_pos = np.min(trigger_pos_ch[trigger_pos_ch>=0])
-    else:
-        trigger_pos = -1
-
-    if list_trigger_flag == [0, 0, 0]:
-        # No trigger                                                                                                                                                                                                                                                            
-        trigger_flag = 0
-    if list_trigger_flag == [1, 0, 0]:
-        # X trigger                                                                                                                                                                                                                                                             
-        trigger_flag = 1
-    if list_trigger_flag == [0, 1, 0]:
-        # Y trigger                                                                                                                                                                                                                                                             
-        trigger_flag = 2
-    if list_trigger_flag == [0, 0, 1]:
-        # Z trigger                                                                                                                                                                                                                                                             
-        trigger_flag = 3
-    if list_trigger_flag == [1, 1, 0]:
-        # X Y trigger                                                                                                                                                                                                                                                           
-        trigger_flag = 12
-    if list_trigger_flag == [1, 0, 1]:
-        # X Z trigger                                                                                                                                                                                                                                                           
-        trigger_flag = 13
-    if list_trigger_flag == [0, 1, 1]:
-        # Y Z trigger                                                                                                                                                                                                                                                           
-        trigger_flag = 23
-    if list_trigger_flag == [1, 1, 1]:
-        # X Y Z trigger                                                                                                                                                                                                                                                           
-        trigger_flag = 123
-
-    return num_pulse, trigger_flag, trigger_pos
-
-
-def find_thresh_triggers(traces,
-                         **kwargs):
-
-    trigger_flags = np.zeros(traces.shape[0],dtype=int)
-    trigger_times = -1*np.ones(traces.shape[0],dtype=int)
+    logger.info(f'Applying notch filters...')
+    for f_notch, r in zip(freqs_notch,radii_notch):
+        logger.info(f'at frequency {f_notch/1e6:.2f} MHz with radius {r:.2f}')
 
     for i, trace in enumerate(traces):
-        _, trigger_flag, trigger_time = thresh_trigger(trace,**kwargs)
+        for ch in range( traces.shape[1] ):
+            trace_filtered = trace[ch].copy()
+            for f_notch, r in zip(freqs_notch,radii_notch):
+                trace_filtered = apply_notch_filter(trace_filtered,f_notch,r)
+            traces_filtered[i,ch] = trace_filtered
+
+    logger.info(f'Traces filtered!')
+
+    return traces_filtered
+
+
+def filter_traces_bandpass(traces,
+                           coeff_file='/sps/grand/pcorrea/nutrig/database/v2/lowpass115MHz.txt',
+                           do_minimum_phase=False):
+    '''
+    Mimics the DIRECT form FIR band-pass filter < 115 MHz that is implemented on the online firmware.
+    Filter coefficients are provided by Xing Xu.
+    Implemented with help of ChatGPT. See also `./test_bandpass_filter.ipynb`.
+
+    Arguments
+    ---------
+    - `traces`
+        + type        : `np.ndarray[int]`
+        + units       : ADC counts
+        + description : Array of ADC traces, with shape `(N_traces,N_channels,N_samples)`.
+
+    - `coeff_file`
+        + type        : str
+        + description : File containing the filter coefficients.
+
+    - `do_minimum_phase`
+        + type        : bool
+        + description : Option to only keep minimum phase coefficients for the filter.
+                                
+    Returns
+    -------
+    - `traces_filtered`
+        + type        : `np.ndarray[float]`
+        + units       : "ADC counts"
+        + description : Array of filtered ADC traces, with shape `(N_traces,N_channels,N_samples)`.
+    '''
+
+    logger.info(f'Applying band-pass filter with cutoff frequency at 115 MHz...')
+
+    coeff = np.loadtxt(coeff_file,delimiter=',')
+
+    # This will get rid of non-physical ripples before simulated pulses
+    # It will also get rid of the phase delay; normally this is (N-1)/2 for N coefficients
+    if do_minimum_phase:
+        coeff = minimum_phase(coeff,method='hilbert')
+
+    traces_filtered = lfilter(coeff,1,traces)
+
+    return traces_filtered.astype(traces.dtype)
+
+
+def trigger_FLT0(trace,
+                 dict_trigger_parameters,
+                 samples_from_edge=100):
+    '''
+    Evaluates the FLT-0 trigger, mimicking the L1 trigger on the FEB.
+    Adapted from Marion Guelfand's script.
+
+    Arguments
+    ---------
+    - `trace`
+      + type        : `np.ndarray[int]`
+      + units       : ADC counts
+      + description : A single ADC trace, with shape `(N_samples)`.
+
+    - `dict_trigger_parameters`
+      + type        : `dict`
+      + fields
+        * `th1` [`int`] : T1 or signal threshold [ADC counts].
+        * `th2` [`int`] : T2 or noise threshold [ADC counts].
+        * `t_quiet` [`int`] : Quiet time before T1 threshold [ns].
+        * `t_period` [`int`] : Time period over which the number of T2 crossings are evaluated [ns].
+        * `t_sepmax` [`int`] : Maximum time allowed between two T2 crossings [ns].
+        * `nc_min` [`int`] : Minimum number of T2 crossings.
+        * `nc_max` [`int`] : Maximum number of T2 crossings.
+
+    - `samples_from_edge`
+      + type        : `int`
+      + units       : ADC samples of 2 ns
+      + description : Number of samples to ignore from the edges of the trace.
+                      Typically required to mitigate boundary effects caused by filtering.
+                      For the notch filter of Kato Sei it seems to only be an issue at the start of the trace.
+                                
+    Returns
+    -------
+    - `traces_filtered`
+      + type        : `np.ndarray[float]`
+      + units       : "ADC counts"
+      + description : Array of filtered ADC traces, with shape `(N_traces,N_du,N_samples)`.
+    
+    '''
+    # Find the indices where the signal crosses the first threshold (T1)
+    index_t1_crossing = np.where(trace > dict_trigger_parameters["th1"])[0]
+    
+    # Lists to store results
+    T1_indices    = []  # Indices of T1 crossings
+    T1_amplitudes = []  # Amplitudes at T1 crossings
+    NC_values     = []  # Number of T2 crossings for each T1 (the T1 is included in NC)
+
+    # Compute the first sample from which T_quiet can be evaluated given boundary conditions
+    sample_min = samples_from_edge #+ dict_trigger_parameters['t_quiet']//2
+
+    # Compute the last sample up to which T_period can be evaluated given boundary conditions
+    sample_max = len(trace) - dict_trigger_parameters['t_period']//2 #- samples_from_edge
+
+    # Process each T1 crossing
+    for index_T1 in index_t1_crossing:
+        # Check if the T1 index is greater than 25 (bug linked to the notch filter: artificial peak that appears)
+        ## to be corrected
+        if index_T1 <= sample_min:
+            logger.debug(f'Skipping T1 @ index = {index_T1}: too close to edge')
+            continue  # Skip this T1 if its index is not greater than 25 (100 for sims ZHAireS)
+
+        if index_T1 >= sample_max:
+            logger.debug(f'Stopping: T_period cannot be evaluated for T1 @ index >= {index_T1}')
+            break
+
+        logger.debug(f'Now checking T1 @ index = {index_T1}')
         
-        trigger_flags[i] = trigger_flag
-        trigger_times[i] = trigger_time
+        start = max(samples_from_edge, index_T1 - dict_trigger_parameters['t_quiet'] // 2)
+        end = index_T1
+        
+        # Check if the signal before T1 is below the first threshold (T1 is valid)
+        if np.all(trace[start:end] <= dict_trigger_parameters["th1"]):
+            # Extract the period after T1 to find T2 crossings
+            period_after_T1 = trace[index_T1: index_T1 + dict_trigger_parameters['t_period'] // 2]
+            positive_T2_crossing = (period_after_T1 > dict_trigger_parameters['th2']).astype(int)
+            
+            # Search for positive T2 crossings
+            mask_T2_crossing_positive = np.diff(positive_T2_crossing) == 1
+            index_T2 = np.where(mask_T2_crossing_positive)[0] + 1 + index_T1
+            index_T2 = np.insert(index_T2, 0, index_T1) #add T1 in index crossings
+            n_T2_crossing = len(index_T2)   # Number of T2 crossings (including the T1 crossing itself)
+            valid_T1 = True
 
-    return trigger_flags, trigger_times
-
-
-def filter_traces(traces,
-                  freq_highpass=50.,
-                  freqs_notch=[50.2,55.1,126],
-                  bw_notch=[1.,1.,25.],
-                  sampling_rate=500.):
-    '''
-    Bandpass filter above > 43 MHz to kill short waves
-    Notch filters to kill communication lines
-
-    Default values are determined from analysis with
-    `test_pretrigger.py` and `find_pretrigger_threshold.ipynb`
-    '''
-
-    if type(bw_notch) == float:
-        bw_notch = np.ones(len(freqs_notch))*bw_notch
-    else:
-        assert len(bw_notch) == len(freqs_notch)
-
-    window = signal.windows.general_gaussian(traces.shape[-1],10,traces.shape[-1]/2.3)
-    traces = window*traces
-
-    sos             = signal.butter(10,freq_highpass,btype='high',analog=False,fs=sampling_rate,output='sos')
-    traces_filtered = signal.sosfiltfilt(sos,traces)
-
-    for freq, bw in zip(freqs_notch,bw_notch):
-        # b, a            = signal.iirnotch(freq,freq/bw,fs=sampling_rate)
-        # traces_filtered = signal.filtfilt(b,a,traces_filtered)
-        freq_bandstop   = [freq-bw/2.,freq+bw/2.]
-        sos             = signal.butter(10,freq_bandstop,btype='bandstop',analog=False,fs=sampling_rate,output='sos')
-        traces_filtered = signal.sosfiltfilt(sos,traces_filtered)
-
-    return np.trunc(traces_filtered)
-
-
-def get_masks_du(du_ids):
-
-    masks_du = {du : np.zeros(du_ids.shape,dtype=bool) for du in np.unique(du_ids)}
-
-    for du in masks_du.keys():
-        for i, du_id in enumerate(du_ids):
-            if du == du_id:
-                masks_du[du][i] = True
+            # Check for maximum separation condition between T2 crossings
+            for i, j in zip(index_T2[:-1], index_T2[1:]):
+                time_separation = (j - i) * 2  # Calculate the time separation between consecutive T2 crossings
                 
-    return masks_du
+                # If the separation is too large, mark T1 as invalid
+                if time_separation > dict_trigger_parameters["t_sepmax"]:
+                    valid_T1 = False
+                    logger.debug(f'Killed by Tsepmax < {time_separation} ns')
+                    break
 
+            # If the number of T2 crossings is out of bounds, ignore this T1
+            # NOTE: online we exclude also when NC == NC_max (NC_min)
+            if n_T2_crossing <= dict_trigger_parameters["nc_min"] or n_T2_crossing >= dict_trigger_parameters["nc_max"]:
+                valid_T1 = False
+                logger.debug(f'Killed by NC = {n_T2_crossing} >= NC_max (or <= NC_min)')
 
-def get_pulse_inj_weights(bkg_pulse_file):
+            if valid_T1:
+                # If T1 is valid, record the number of T2 crossings
+                NC_values.append(n_T2_crossing)
+                T1_indices.append(index_T1)
+                T1_amplitudes.append(trace[index_T1])
+                logger.debug(f'OK! N_crossings = {n_T2_crossing}')
 
-    assert os.path.splitext(bkg_pulse_file)[1] == '.npz', f'Pulse file does not have the correct extension {os.path.splitext(bkg_pulse_file)[1]}'
+        else:
+            logger.debug(f'Killed by {len( np.where( trace[start:end] > dict_trigger_parameters["th1"] )[0] )} T1 crossings within T_quiet')
 
-    logger.info(f'Getting injection time weights from {bkg_pulse_file}')
-
-    f             = np.load(bkg_pulse_file)
-    n_samples     = f['traces'].shape[-1]
-    pretrig_times = f['pretrig_times']
-
-    bin_edges  = np.arange(n_samples+1)
-    weights, _ = np.histogram(pretrig_times,bins=bin_edges,density=True)
-
-    return weights
-
-
-def get_noise_traces(noise_dir,
-                     n_traces,
-                     rng=np.random.default_rng()):
-    
-    noise_files = sorted( glob.glob( os.path.join(noise_dir,'*.npz') ) ) # sort to get rid of glob randomness
-    noise_file  = rng.choice(noise_files)
-
-    logger.info(f'Selecting {n_traces} random noise traces from {noise_file}')
-
-    with np.load(noise_file) as f:
-        entries      = rng.choice( np.arange( f['traces'].shape[0] ),size=n_traces,replace=False )
-        noise_traces = f['traces'][entries]
-
-    return noise_traces, noise_file, entries
-
-
-def add_sim_to_noise(sim_traces,
-                     noise_traces,
-                     inj_weights=None,
-                     rng=np.random.default_rng(),
-                     adc_saturation=2**13,
-                     offset=15):
-    
-    logger.info(f'Adding {sim_traces.shape[0]} simulated pulses to noise traces at random trace positions')
-
-    sim_traces = set_trace_length(sim_traces,noise_traces.shape[-1])
-    n_traces   = sim_traces.shape[0]
-    n_samples  = sim_traces.shape[-1]
-
-    #-#-#- Get random injection times according to given weights  -#-#-#
-    if type(inj_weights) == type(None):
-        logger.warning('No weights given. Pulses are added uniformly over entire trace.')
-        inj_weights  = np.ones(n_samples)
-        inj_weights /= inj_weights.sum()
+      
+    if T1_indices:
+        return T1_indices, T1_amplitudes, NC_values
     else:
-        assert noise_traces.shape[-1] == inj_weights.shape[-1]
-
-    max_sample_inj  = rng.choice(np.arange(n_samples),size=n_traces,p=inj_weights)
+        return  # Do nothing if no valid T1 crossings were found
     
-    #-#-#- Find the corresponding 'start time' of the pulse with peak at the injection time -#-#-#
-    sim_trace_abs   = np.abs(sim_traces)
-    max_samples_sim = np.argmax( sim_trace_abs,axis=2,keepdims=True ) 
-    max_sim         = np.take_along_axis( sim_trace_abs,max_samples_sim,axis=2 )
-    max_sim_pol     = np.argmax( max_sim[...,0],axis=1,keepdims=True )
-    max_sample_sim  = np.take_along_axis( max_samples_sim[...,0],max_sim_pol,axis=1 )[...,0]
 
-    pulse_start_inj = max_sample_inj - max_sample_sim + offset + n_samples
+def do_FLT0(traces,
+            *args,
+            channels=[0,1],
+            **kwargs):
+    '''
+    Wrapper for the `trigger_FLT0` function.
+    Performs the FLT-0 for an array of multiple traces.
+    Only the first FLT-0 trigger is recorded if there are multiple pulses.
+    With default parameters it is rare to have multiple FLT-0 triggers in one trace.
 
+    Arguments
+    ---------
+    - `traces`
+      + type        : `np.ndarray[int]`
+      + units       : ADC counts
+      + description : Array of ADC traces, with shape `(N_traces,N_channels,N_samples)`.
 
-    # max_sample_rand  = rng.integers(100,n_samples-100,n_traces) # not near edges of trace
+    - `*args`
+      + description : Positional arguments to pass to `trigger_FLT0`.
 
-    #-#-#- Add simulated air-shower pulse to noise trace  -#-#-#
-    sig_traces        = np.zeros(sim_traces.shape)
-    noise_range_dummy = np.arange(n_samples,2*n_samples,dtype=int)
+    - `channels`
+      + type        : `list[int]`
+      + description : Channels for which to evaluate the FLT-0.
+                      Default assumes that trace has three channels (0,1,2) = (X,Y,Z) and only evaluates X and Y.
 
-    for i in range(n_traces):
-        sig_trace       = np.zeros((3,n_samples*3))
-        sig_range_dummy = np.arange(pulse_start_inj[i],pulse_start_inj[i]+n_samples,dtype=int)
+    - `**kwargs`
+      + description : Keyword arguments to pass to `trigger_FLT0`.
+                                
+    Returns
+    -------
+    - `FLT0_flags`
+      + type        : `np.ndarray[bool]`
+      + description : Flags of the FLT-0. `True` for a trigger, `False` if there was no trigger. Shape: `(N_traces,N_channels)`.
 
-        sig_trace[:,noise_range_dummy] += noise_traces[i]        
-        sig_trace[:,sig_range_dummy]   += sim_traces[i]
+    - `FLT0_first_T1_idx`
+      + type        : `np.ndarray[int]`
+      + description : Sample/index of the first T1 crossing corresponding to an FLT-0. `-1` if there was no trigger. Shape: `(N_traces,N_channels)`.
 
-        sig_traces[i] = sig_trace[:,noise_range_dummy]
+    - `n_FLT0`
+      + type        : `np.ndarray[int]`
+      + description : Number of FLT-0 triggers for each trace. Shape: `(N_traces,N_channels)`.
+    '''
 
-    #-#-#- Saturate a possible signal at the ADC limit -#-#-#
-    sig_traces = np.where(np.abs(sig_traces)<adc_saturation,sig_traces,np.sign(sig_traces)*adc_saturation)
+    logger.info(f'Performing FLT-0 trigger for {len(traces)} traces...')
 
-    return sig_traces, max_sample_inj
-
-
-def rms(trace,
-        samples_from_trace_edge=100,
-        **kwargs):
+    FLT0_flags         = np.zeros( (traces.shape[0],traces.shape[1]),dtype=bool )
+    FLT0_first_T1_idcs = -1 * np.ones( (traces.shape[0],traces.shape[1]),dtype=int )
+    n_FLT0             = np.zeros( (traces.shape[0],traces.shape[1]),dtype=int )
     
-    trace_without_edges = trace[...,samples_from_trace_edge:trace.shape[-1]-samples_from_trace_edge]
+    for i, trace in enumerate(traces):
+        logger.debug(f'Searching triggers in trace {i}')
+        for ch in channels:
+            logger.debug(f'Channel {ch}')
+
+            try:
+                T1_indices, T1_amplitudes, NC_values = trigger_FLT0(trace[ch],*args,**kwargs)
+                FLT0_flags[i,ch]                     = True
+                FLT0_first_T1_idcs[i,ch]             = T1_indices[0]
+                n_FLT0[i,ch]                        += len(T1_indices)
+
+            except:
+                continue
+
+    res_FLT0 = {'FLT0_flags' : FLT0_flags,
+                'FLT0_first_T1_idcs' : FLT0_first_T1_idcs,
+                'n_FLT0' : n_FLT0}
+
+    return res_FLT0
+
+
+def compute_FLT0_trigger_rate_MD(n_FLT0,
+                                 FLT0_flags,
+                                 du_ids,
+                                 du_seconds,
+                                 du_nanoseconds,
+                                 t_eff,
+                                 channels=[0,1]):
+
+    # Get unique DU IDs and the corresponding number of entries
+    du_ids_unique, n_entries_per_du = np.unique(du_ids,return_counts=True)
+
+    t_bin               = np.zeros( du_ids_unique.shape[0] ) # time bin over which the rate is computed
+    trigger_rate_per_ch = np.zeros( ( du_ids_unique.shape[0],n_FLT0.shape[1] ) )
+    trigger_rate_OR     = np.zeros( du_ids_unique.shape[0] )
+    trigger_rate_AND    = np.zeros( du_ids_unique.shape[0] )
+
+    mask_OR  = np.any( FLT0_flags[:,channels],axis=1 )
+    mask_AND = np.all( FLT0_flags[:,channels],axis=1 )
+
+    for i, du_id in enumerate(du_ids_unique):
+        t_du     = du_seconds[du_ids==du_id] + du_nanoseconds[du_ids==du_id]*1e-9 # [s]
+        t_bin[i] = t_du[-1] - t_du[0] # [s]
+
+        n_FLT0_du    = n_FLT0[du_ids==du_id]
+        t_eff_tot_du = n_entries_per_du[i] * t_eff # [s]
+
+        mask_OR_du  = mask_OR[du_ids==du_id]
+        mask_AND_du = mask_AND[du_ids==du_id]
+
+        trigger_rate_per_ch[i] = np.sum( n_FLT0_du,axis=0 ) / t_eff_tot_du # [Hz]
+        trigger_rate_OR[i]     = np.sum( np.max( n_FLT0_du[mask_OR_du],axis=1 ) ) / t_eff_tot_du # [Hz]
+        trigger_rate_AND[i]    = np.sum( np.max( n_FLT0_du[mask_AND_du],axis=1 ) ) / t_eff_tot_du # [Hz]
+
+    res_FLT0_trigger_rate = {'trigger_rate_per_ch' : trigger_rate_per_ch,
+                             'trigger_rate_OR' : trigger_rate_OR,
+                             'trigger_rate_AND' : trigger_rate_AND,
+                             't_bin' : t_bin}
+
+    return res_FLT0_trigger_rate
+
+
+def compute_FLT0_trigger_rate_UD(n_FLT0,
+                                 FLT0_flags,
+                                 du_ids,
+                                 du_seconds,
+                                 du_nanoseconds,
+                                 channels=[0,1]):
+
+    # Get unique DU IDs and the corresponding number of entries
+    du_ids_unique, n_entries_per_du = np.unique(du_ids,return_counts=True)
+
+    t_bin               = np.zeros( du_ids_unique.shape[0] ) # time bin over which the rate is computed
+    trigger_rate_per_ch = np.zeros( ( du_ids_unique.shape[0],n_FLT0.shape[1] ) )
+    trigger_rate_OR     = np.zeros( du_ids_unique.shape[0] )
+    trigger_rate_AND    = np.zeros( du_ids_unique.shape[0] )
+
+    mask_OR  = np.any( FLT0_flags[:,channels],axis=1 )
+    mask_AND = np.all( FLT0_flags[:,channels],axis=1 )
+
+    for i, du_id in enumerate(du_ids_unique):
+        t_du     = np.sort( du_seconds[du_ids==du_id] + du_nanoseconds[du_ids==du_id]*1e-9 ) # [s]
+        t_bin[i] = t_du[-1] - t_du[0] # [s]
+
+        n_FLT0_du = n_FLT0[du_ids==du_id]
+
+        mask_OR_du  = mask_OR[du_ids==du_id]
+        mask_AND_du = mask_AND[du_ids==du_id]
+
+        trigger_rate_per_ch[i] = np.sum( n_FLT0_du,axis=0 ) / t_bin[i] # [Hz]
+        trigger_rate_OR[i]     = np.sum( np.max( n_FLT0_du[mask_OR_du],axis=1 ) ) / t_bin[i] # [Hz]
+        trigger_rate_AND[i]    = np.sum( np.max( n_FLT0_du[mask_AND_du],axis=1 ) ) / t_bin[i] # [Hz]
+
+    res_FLT0_trigger_rate = {'trigger_rate_per_ch' : trigger_rate_per_ch,
+                             'trigger_rate_OR' : trigger_rate_OR,
+                             'trigger_rate_AND' : trigger_rate_AND,
+                             't_bin' : t_bin}
+
+    return res_FLT0_trigger_rate
+
+
+def get_snr_and_t_pulse(traces,
+                        FLT0_flags,
+                        FLT0_first_T1_idcs,
+                        samples_from_edge=100,
+                        window_size_max=100):
+    '''
+    Computes the SNR and pulse-peak times for pulses in a data sample.
+    The SNR per channel is defined as max(trace_ch)/rms(trace_ch).
+    The SNR of the event, outputted here, is the maximum of the SNRs of the channels over which there was an FLT-0.
+    The maximum is computed in a window of size `max_range` samples after the first T1 threshold index.
+    The RMS is computed for all the samples after the above window.
+    Samples close to the trace edge are ignored to mitigate boundary effects from filtering.
+
+    Arguments
+    ---------
+    - `traces`
+        + type        : `np.ndarray[int]`
+        + units       : ADC counts
+        + description : Array of ADC traces, with shape `(N_traces,N_channels,N_samples)`.
+
+    - `FLT0_flags`
+        + type        : `np.ndarray[bool]`
+        + description : Flags of the FLT-0. `True` for a trigger, `False` if there was no trigger. Shape: `(N_traces,N_channels)`.
+
+    - `FLT0_first_T1_idcs`
+        + type        : `np.ndarray[int]`
+        + description : Sample/index of the first T1 crossing corresponding to an FLT-0. `-1` if there was no trigger. Shape: `(N_traces,N_channels)`.
+
+    - `samples_from_edge`
+        + type        : `int`
+        + units       : ADC samples of 2 ns
+        + description : Number of samples to ignore from the edges of the trace.
+                        Typically required to mitigate boundary effects caused by filtering.
+
+    - `window_size_max`
+        + type        : `int`
+        + units       : ADC samples of 2 ns
+        + description : Number of samples to consider, starting from the first T1 threshold crossing, for the computation of the trace maximum.
+                                
+    Returns
+    -------
+    - `snr`
+        + type        : `np.ndarray[float]`
+        + description : SNR for all input traces. 0 if the trace does not contain a pulse. Shape: `(N_traces)`.
+
+    - `snr`
+        + type        : `np.ndarray[float]`
+        + description : Pulse-peak time for all input traces. -1 if the trace does not contain a pulse. Shape: `(N_traces,N_channels)`.
+    '''
     
-    rms = np.sqrt( np.mean( trace_without_edges**2,**kwargs ) )
+    snr_ch  = np.zeros( FLT0_flags.shape,dtype=float )
+    t_pulse = np.ones( FLT0_flags.shape,dtype=int )
+    n_entries, n_channels, n_samples = traces.shape
 
-    return rms
+    for i in range(n_entries):
+        for ch in range(n_channels):
+            if FLT0_flags[i,ch]:
+                # Define the samples over which to compute the maximum and RMS
+                mask_max = np.arange( FLT0_first_T1_idcs[i,ch], FLT0_first_T1_idcs[i,ch]+window_size_max )
+                mask_rms = np.arange( FLT0_first_T1_idcs[i,ch]+window_size_max, n_samples-samples_from_edge )
 
+                max_ch = np.max( traces[i,ch,mask_max] )
+                rms_ch = np.sqrt( np.mean( traces[i,ch,mask_rms]**2 ) )
 
-def get_snr(sig_traces,
-            inj_pulse_times,
-            jitter_size=20,
-            window_size=100):
+                snr_ch[i,ch]  = max_ch/rms_ch
+                t_pulse[i,ch] = FLT0_first_T1_idcs[i,ch] + np.argmax( traces[i,ch,mask_max] )
     
-    snr = np.zeros( (sig_traces.shape[0],sig_traces.shape[1]) )
+    # The final SNR of an event is the maximum of all the SNRs per channel
+    snr = np.max(snr_ch,axis=1)
 
-    for i, sig_trace in enumerate(sig_traces):
-        inj_pulse_time = inj_pulse_times[i]
-        max_pulse      = np.max( np.abs( sig_trace[...,inj_pulse_time-jitter_size:inj_pulse_time+jitter_size] ),axis=1 )
+    return snr, t_pulse
 
-        window_pulse = np.arange( np.max( [0,inj_pulse_time-window_size] ),
-                                  np.min( [sig_trace.shape[-1],inj_pulse_time+window_size] ) )
-        
-        trace_without_pulse = np.delete(sig_trace,window_pulse,axis=1)
-        rms_without_pulse   = rms(trace_without_pulse,axis=1)
 
-        snr[i] = max_pulse / rms_without_pulse
+def select_pulses_per_snr_bin(data,
+                              snr_bins=np.linspace(3,8,6),
+                              target_entries_per_bin=1000,
+                              mode_snr='UNIFORM',
+                              n_channels=3,
+                              n_samples=1024):
     
-    return snr
+    logger.info(f'Selecting traces in the following SNR bins: {snr_bins}')
+    logger.info(f'Selection mode: {mode_snr}')
+    
+    selected_data = {}
+
+    selected_data['traces']     = np.zeros( (0,n_channels,n_samples),dtype=int )
+    selected_data['FLT0_flags'] = np.zeros( (0,n_channels), dtype=bool )
+    selected_data['snr']        = np.zeros( (0,),dtype=float )
+    selected_data['t_pulse']    = np.zeros( (0,n_channels),dtype=int )
+    
+    if mode_snr == 'UNIFORM':
+        logger.info(f'Targeting {target_entries_per_bin} entries per bin...')
+
+        for i in range( len( snr_bins ) - 1 ):
+            idcs_snr_bin = np.where( np.logical_and( data['snr'] >= snr_bins[i], data['snr'] < snr_bins[i+1] ) )[0]
+
+            size_sel = min( target_entries_per_bin,len(idcs_snr_bin) )
+            idcs_sel = np.random.choice(idcs_snr_bin, size=size_sel, replace=False)
+            
+            selected_data['traces']     = np.vstack( (selected_data['traces'],data['traces'][idcs_sel]) )
+            selected_data['FLT0_flags'] = np.vstack( (selected_data['FLT0_flags'],data['FLT0_flags'][idcs_sel]) )
+            selected_data['snr']        = np.hstack( (selected_data['snr'],data['snr'][idcs_sel]) )
+            selected_data['t_pulse']    = np.vstack( (selected_data['t_pulse'],data['t_pulse'][idcs_sel]) )
+
+            logger.info(f'Selected {size_sel} background pulses in SNR bin [{snr_bins[i]},{snr_bins[i+1]}]')
+
+    return selected_data

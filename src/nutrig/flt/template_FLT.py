@@ -16,10 +16,10 @@ from scipy.optimize import curve_fit
 ###-###-###-###-###-###-###- LOGGER SETUP -###-###-###-###-###-###-###
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+#logger.setLevel(logging.DEBUG)
 
 handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
+#handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-7.7s]  %(message)s")
 handler.setFormatter(formatter)
 if logger.hasHandlers():
@@ -167,11 +167,7 @@ class TemplateFLT:
 
 
     def load_templates(self,
-                       path_template_dir,
-                       n_templates,
-                       pol,
-                       rf_chain,
-                       random_temp=None):
+                       path_template_file):
         '''
         Loads in templates saved in a file of the following format:
         
@@ -181,40 +177,24 @@ class TemplateFLT:
 
         Arguments
         ---------
-        `path_template_dir`
+        `path_template_file`
         type        : str
-        description : Path to the directory where the file containing the templates is stored.
-
-        `pol`
-        type        : str
-        description : Specifies the polarization of the templates.
-
-        `rf_chain`
-        type        : str
-        description : Specifies the version of the RF chain used to generate the templates.
+        description : Path to the file containing the templates in npz format.
         '''
 
-        assert pol in ['XY','Z']
-        assert rf_chain in ['rfv1','rfv2']
+        if not os.path.exists(path_template_file):
+            raise FileNotFoundError(f'Template file not found: {path_template_file}')
 
-        if random_temp is not None:
-            path_template_file  = os.path.join(path_template_dir,f'templates_random_{random_temp}_{n_templates}_{pol}_{rf_chain}.npz')
-        else:
-            path_template_file  = os.path.join(path_template_dir,f'templates_{n_templates}_{pol}_{rf_chain}.npz')
+        try:
+            with np.load(path_template_file) as template_file:
+                self.templates = template_file['templates']
+        except:
+            raise KeyError(f'"templates" not found in the file: {path_template_file}')
 
-        template_file       = np.load(path_template_file)
-
-        self.templates = template_file['templates']
-
-        assert n_templates == len(self.templates)
-
-        self.pol         = pol
-        self.rf_chain    = rf_chain
-        self.n_templates = n_templates
-
+        self.n_templates = len(self.templates)
+        logger.info(f'Loaded {self.n_templates} templates from {path_template_file}')
+        
         self._desample_templates()
-
-        logger.info(f'Loaded {n_templates} templates from {path_template_file}')
 
         return
     
@@ -235,7 +215,7 @@ class TemplateFLT:
         templates_desampled = np.zeros( (self.n_templates,self._desampling_factor,len_templates_desampled) )
 
         for i in range(self._desampling_factor):
-            templates_desampled[:,i,:] = self.templates[:,i::4]
+            templates_desampled[:,i,:] = self.templates[:,i::self._desampling_factor]
 
         self.templates_desampled = templates_desampled
 
@@ -266,13 +246,13 @@ class TemplateFLT:
         if sim_sampling_rate % adc_sampling_rate != 0:
             logger.warning(f'Template sampling rate is not a multiple of ADC sampling rate')
 
-        self.sim_sampling_rate = sim_sampling_rate
-        self.adc_sampling_rate = adc_sampling_rate
-        self.desampling_factor = int( self.sim_sampling_rate/self.adc_sampling_rate )
+        self._sim_sampling_rate = sim_sampling_rate
+        self._adc_sampling_rate = adc_sampling_rate
+        self._desampling_factor = int( self._sim_sampling_rate/self._adc_sampling_rate )
 
-        logger.debug(f'Desampling factor = {self.desampling_factor}')
+        logger.debug(f'Desampling factor = {self._desampling_factor}')
 
-        self._desample_templates()
+        #self._desample_templates()
 
         return
 
@@ -363,8 +343,6 @@ class TemplateFLT:
         corr = np.correlate(trace,
                             template,
                             mode='valid')
-        
-        corr /= len(template) # normalizes between [-1,1]
 
         return corr
     
@@ -413,15 +391,15 @@ class TemplateFLT:
          
         len_templates_desampled = self.templates_desampled.shape[-1]
         #corr_window_size        = self._corr_window[1] - self._corr_window[0]
-        t     = np.arange( trace.shape[-1] )[pre_trigger_time-5:-100]
-        idx_0 = np.argmax( np.abs( trace[pre_trigger_time-5:-100] ) )
-        t_0   = t[idx_0]
+        # t     = np.arange( trace.shape[-1] )[pre_trigger_time-5:-100]
+        # idx_0 = np.argmax( np.abs( trace[pre_trigger_time-5:-100] ) )
+        # t_0   = t[idx_0]
 
         # Make sure the window for the correlation scan is not outside the trace bounds
-        # corr_window_start = int( np.max( [pre_trigger_time+self._corr_window[0],0] ) )
-        # corr_window_end   = int( np.min( [pre_trigger_time+self._corr_window[1]+len_templates_desampled,len(trace)] ) )
-        corr_window_start = int( np.max( [t_0+self._corr_window[0],0] ) )
-        corr_window_end   = int( np.min( [t_0+self._corr_window[1]+len_templates_desampled,len(trace)] ) )
+        corr_window_start = int( np.max( [pre_trigger_time+self._corr_window[0],0] ) )
+        corr_window_end   = int( np.min( [pre_trigger_time+self._corr_window[1]+len_templates_desampled,len(trace)] ) )
+        #corr_window_start = int( np.max( [t_0+self._corr_window[0],0] ) )
+        #corr_window_end   = int( np.min( [t_0+self._corr_window[1]+len_templates_desampled,len(trace)] ) )
 
         # Only select the relevant samples of the trace in the correlation window
         t_window     = np.arange(corr_window_start,corr_window_end) - self._template_peak_sample
@@ -429,15 +407,16 @@ class TemplateFLT:
 
         # Calculate the sliding RMS of the trace to normalize the cross correlation
         sliding_trace_window = np.lib.stride_tricks.sliding_window_view(trace_window,len_templates_desampled)
-        sliding_rms          = rms(sliding_trace_window,axis=1)
-        print(sliding_rms)
+        sliding_trace_norm   = np.linalg.norm(sliding_trace_window,axis=1)
+
         # Compute the cross correlation for all desampled templates
-        corr_desampled = np.zeros( (self.n_templates,self._desampling_factor,sliding_rms.shape[0]) )
+        corr_desampled = np.zeros( (self.n_templates,self._desampling_factor,sliding_trace_window.shape[0]) )
 
         for i, template_desampled_set in enumerate(self.templates_desampled):
             for j, template_desampled in enumerate(template_desampled_set):
-                corr_desampled[i,j] = self._cross_corr_1_template(trace_window,template_desampled) / sliding_rms
-        
+                template_norm = np.linalg.norm(template_desampled)
+                corr_desampled[i,j] = self._cross_corr_1_template(trace_window,template_desampled) / sliding_trace_norm / template_norm # Normalized between [-1,1]
+
         return corr_window_start, corr_desampled
 
 
@@ -480,7 +459,7 @@ class TemplateFLT:
         time_best = corr_window_start*np.ones(self.n_templates)
 
         for k, i in enumerate(self.idx_templates_desampled_best):
-            corr_best[k]  = corr_best_desampled[k,i] * corr_desampled_sign[k,i,time_corr_best_desampled[k,i]]
+            corr_best[k]  = corr_best_desampled[k,i] #* corr_desampled_sign[k,i,time_corr_best_desampled[k,i]]
             time_best[k] += time_corr_best_desampled[k,i]
 
         self.corr_best = corr_best
@@ -636,15 +615,17 @@ class TemplateFLT:
 
         norm_trace = normalize(trace) # normalize the trace here
 
-        logger.info('fitting time')
+        logger.info('Cross correlating templates with trace (time fit)...')
         self._fit_time(norm_trace,pre_trigger_time)
 
-        logger.info('fitting amplitude')
-        self._fit_amplitude(norm_trace)
+        # logger.info('fitting amplitude')
+        # self._fit_amplitude(norm_trace)
 
-        logger.info('computing ts')
-        self.idx_template_best_fit = np.argmin(self.chi2)
+        #self.idx_template_best_fit = np.argmin(self.chi2)
         #self.idx_template_best_fit = np.argmax( np.abs(self.ampl_best) )
+
+        logger.info('Computing TS (max corr)...')
+        self.idx_template_best_fit = np.argmax(self.corr_best)
         self._compute_ts()
 
         return
