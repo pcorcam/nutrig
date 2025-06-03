@@ -1,0 +1,14 @@
+# Compiled files
+__pycache__
+
+# Plots
+plots
+*.png
+*.pdf
+
+# Output files
+*.root
+*.npz
+
+# VScode
+.vscode
