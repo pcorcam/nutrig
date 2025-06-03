@@ -1,8 +1,0 @@
-{
-    "python.analysis.extraPaths": [
-        "/pbs/home/p/pcorrea/grand/grandlib/"
-    ],
-    "python.autoComplete.extraPaths": [
-        "/pbs/home/p/pcorrea/grand/grandlib/"
-    ]
-}
