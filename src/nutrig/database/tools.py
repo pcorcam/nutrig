@@ -10,6 +10,7 @@ from scipy.signal import lfilter, minimum_phase
 from scipy.signal.windows import gaussian
 
 import grand.dataio.root_trees as rt
+from grand.geo.coordinates import Geodetic, GRANDCS
 
 logger = logging.getLogger(__name__)
 
@@ -648,3 +649,33 @@ def select_pulses_per_snr_bin(data,
             logger.info(f'Selected {size_sel} background pulses in SNR bin [{snr_bins[i]},{snr_bins[i+1]}]')
 
     return selected_data
+
+
+def get_du_xyz(
+    long,
+    lat,
+    alt,
+    obstime='2024-01-01', # other times, like the TRUE observation time, don't seem to work...
+    origin=Geodetic(
+        latitude=40.99746387,
+        longitude=93.94868871,
+        height=0) # lat, lon of the center station (from FEB@rocket) # z=0 @ sea level)
+):
+    '''
+    Adapted from Marion Guelfand's script.
+    '''
+
+    logger.debug(origin)
+    logger.debug(obstime)
+
+    logger.debug('hey')
+    # From GPS to Cartisian coordinates
+    geod = Geodetic(latitude=lat, longitude=long, height=alt)
+    logger.debug(geod.T.shape)
+    gcs  = GRANDCS(geod, obstime=obstime, location=origin)
+
+    
+
+    logger.debug(gcs.T.shape)
+
+    return gcs.T

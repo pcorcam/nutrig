@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # FIXED PARAMETERS #
 ####################
 
-RUN_NUMBER          = 10083 #10083
-DATA_DIR            = '/sps/grand/data/gp80/GrandRoot/2025/04' #/05
+RUN_NUMBER          = 10086 #10083
+DATA_DIR            = '/sps/grand/data/gp80/GrandRoot/2025/05' #/05
 DATA_FILES          = sorted( glob.glob( os.path.join( DATA_DIR,f'GP80_*_RUN{RUN_NUMBER}_CD_*.root' ) ) )
 FLOAT_CH            = 0
 N_CHANNELS          = 4
@@ -127,18 +127,21 @@ def load_data(data_file,
                 except:
                     continue # this is just for debugging when we don't use the full input data for testing
 
+        # Get the DU coordinates
+        gps_long = np.array( trawvoltage.gps_long ) # [deg]
+        gps_lat  = np.array( trawvoltage.gps_lat ) # [deg]
+        gps_alt  = np.array( trawvoltage.gps_alt ) # [m]
+        du_xyz   = tools.get_du_xyz( gps_long,gps_lat,gps_alt ) # [m]
+
         # There is a bug in event number, so add as follows: file_number*1000 + entry
         file_number  = int( data_file.split('-')[-1].replace('.root','') )
         event_number = int( file_number*1000 + event_entry )
-
-        # Get the DU coordinates
-        du_long = np.array( trawvoltage.gps_long )
-        du_lat  = np.array( trawvoltage.gps_lat )
 
         data['traces']         = traces
         data['du_ids']         = du_ids
         data['du_seconds']     = np.array( tadc.du_seconds )
         data['du_nanoseconds'] = np.array( tadc.du_nanoseconds )
+        data['du_xyz']         = du_xyz
         data['event_number']   = event_number
         data['run_number']     = tadc.run_number
 
@@ -224,7 +227,7 @@ if __name__ == '__main__':
         with rt.DataFile(data_file) as df:
             n_events = df.tadc.get_number_of_entries()
 
-        for event_entry in range(n_events)[:1]:
+        for event_entry in range(n_events)[:]:
             # Load the traces
             logger.info(f'>>> Loading data for event {event_entry+1}/{n_events}...')
 
@@ -275,6 +278,7 @@ if __name__ == '__main__':
                          du_ids=data['du_ids'],
                          du_seconds=data['du_seconds'],
                          du_nanoseconds=data['du_nanoseconds'],
+                         du_xyz=data['du_xyz'],
                          event_number=data['event_number'],
                          run_number=data['run_number'],
                          FLT0_flags=res_FLT0['FLT0_flags'],
