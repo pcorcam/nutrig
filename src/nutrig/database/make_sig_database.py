@@ -237,7 +237,7 @@ if __name__ == '__main__':
 
 
         # Loop over all events in file
-        for event_entry in range(N_EVENTS_FILE)[:10]:
+        for event_entry in range(N_EVENTS_FILE)[:]:
 
             # Load the traces
             logger.info(f'>>> Loading data for event {event_entry+1}/{N_EVENTS_FILE}...')
