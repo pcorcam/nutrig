@@ -32,15 +32,13 @@ logger = logging.getLogger(__name__)
 # FIXED PARAMETERS #
 ####################
 
+ARRAY                 = 'GP289'
 SIM_SOFTWARE          = 'ZHAireS'
-SIM_TAG               = 'DC2.1rc2'
-SIM_BASEDIR           = f'/sps/grand/{SIM_TAG}'
-# SIM_ADC_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{SIM_SOFTWARE}-AN_*/**/adc_*_L1_*.root' ), recursive=True)
-# SIM_SHOWER_FILES      = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{SIM_SOFTWARE}-AN_*/**/shower_*_L0_*.root' ), recursive=True)
-# SIM_RUN_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{SIM_SOFTWARE}-AN_*/**/run_*_L1_*.root' ), recursive=True)
-SIM_ADC_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_Test-AN-dev_*/**/adc_*_L1_*.root' ), recursive=True )
-SIM_SHOWER_FILES      = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_Test-AN-dev_*/**/shower_*_L0_*.root' ), recursive=True )
-SIM_RUN_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_Test-AN-dev_*/**/run_*_L1_*.root' ), recursive=True )
+SIM_TAG               = 'DC2.1rc4'
+SIM_BASEDIR           = f'/sps/grand/{SIM_TAG}/{ARRAY}{SIM_SOFTWARE}-AN'
+SIM_ADC_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{ARRAY}{SIM_SOFTWARE}-AN_*/**/adc_*_L1_*.root' ), recursive=True )
+SIM_SHOWER_FILES      = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{ARRAY}{SIM_SOFTWARE}-AN_*/**/shower_*_L0_*.root' ), recursive=True )
+SIM_RUN_FILES         = glob.glob( os.path.join( SIM_BASEDIR,f'sim_*_{ARRAY}{SIM_SOFTWARE}-AN_*/**/run_*_L1_*.root' ), recursive=True )
 N_EVENTS_FILE         = 1000
 SAMPLE_PULSE_PEAK_INJ = int(550/2)
 JITTER_WIDTH          = 20
@@ -178,7 +176,8 @@ if __name__ == '__main__':
     logger = tools.load_logger(parse_args.verbose)
     logger.info('*** START OF SCRIPT ***')
 
-    logger.debug(SIM_RUN_FILES)
+    logger.debug(SIM_ADC_FILES)
+    logger.debug(os.path.join( SIM_BASEDIR,f'sim_*_{ARRAY}{SIM_SOFTWARE}-AN_*/**/adc_*_L1_*.root' ))
 
     try:
         # Get the matching ADC and shower files
@@ -238,7 +237,7 @@ if __name__ == '__main__':
 
 
         # Loop over all events in file
-        for event_entry in range(N_EVENTS_FILE)[:]:
+        for event_entry in range(N_EVENTS_FILE)[:10]:
 
             # Load the traces
             logger.info(f'>>> Loading data for event {event_entry+1}/{N_EVENTS_FILE}...')
